@@ -10,6 +10,7 @@ import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import logging
 
 
 GCL = 200  # General call limit
@@ -61,7 +62,7 @@ class Caller:
         while True:
             if self._has_limit_to_call_now():
                 # Respeita pausa global vigente, se houver
-                if gpr := global_pause_remaining() > 0:
+                if (gpr := global_pause_remaining()) > 0:
                     await asyncio.sleep(gpr)
                 self.current_limit -= 1
                 self.last_call_ts = time.monotonic()
@@ -97,13 +98,53 @@ UPSTREAM_BASE = "http://127.0.0.1:8001"
 OUTBOUND_MAX_CONNECTIONS = 1000
 OUTBOUND_MAX_KEEPALIVE = 1000
 
+# Detect optional HTTP/2 support (requires the 'h2' package)
+try:
+    import h2  # type: ignore  # noqa: F401
+    H2_AVAILABLE = True
+except Exception:
+    H2_AVAILABLE = False
+
+logger = logging.getLogger("access_api")
+
+
+def should_enable_http2() -> bool:
+    """Return True if HTTP/2 should be enabled.
+
+    Behavior:
+    - If ACCESS_API_HTTP2 is undefined: enable HTTP/2 only when 'h2' is installed.
+    - If ACCESS_API_HTTP2 in {"1","true","yes","on"}: request HTTP/2; if 'h2' is missing,
+      we will log a warning and fall back to HTTP/1.1 to avoid startup errors.
+    - If ACCESS_API_HTTP2 in {"0","false","no","off"}: force disable HTTP/2.
+    """
+    env = os.getenv("ACCESS_API_HTTP2")
+    if env is None:
+        return H2_AVAILABLE
+    val = env.strip().lower()
+    if val in {"0", "false", "no", "off"}:
+        return False
+    if val in {"1", "true", "yes", "on"}:
+        if not H2_AVAILABLE:
+            logger.warning(
+                "ACCESS_API_HTTP2 requested but 'h2' not installed; falling back to HTTP/1.1"
+            )
+        return H2_AVAILABLE
+    # Any other value: be conservative and disable
+    return False
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Cria httpx.AsyncClient e garante fechamento no shutdown."""
+    http2_enabled = should_enable_http2()
+    if http2_enabled:
+        logger.info("Starting HTTP client with HTTP/2 enabled")
+    else:
+        logger.info("Starting HTTP client with HTTP/1.1 (HTTP/2 disabled)")
+
     app.state.http = httpx.AsyncClient(
         base_url=UPSTREAM_BASE,
-        http2=True,
+        http2=http2_enabled,
         timeout=httpx.Timeout(60.0, connect=10.0, read=60.0, write=60.0),
         limits=httpx.Limits(
             max_connections=OUTBOUND_MAX_CONNECTIONS,
