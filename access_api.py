@@ -1,6 +1,7 @@
 from math import ceil
 import os
 import random
+import sys
 import time
 import asyncio
 from typing import Optional
@@ -73,9 +74,32 @@ class Caller:
                     await asyncio.sleep(gpr)
                 self.current_limit -= 1
                 self.last_call_ts = time.monotonic()
-                resp = await forward_request_to_upstream(req)
-                self.last_response_received_ts = time.monotonic()
-                return resp
+                # Enforce an optional hard timeout for the entire upstream attempt.
+                # This is a global, coarse timeout separate from httpx's connect/read/write timeouts.
+                try:
+                    if UPSTREAM_HARD_TIMEOUT_SECONDS > 0:
+                        resp = await asyncio.wait_for(
+                            forward_request_to_upstream(req),
+                            timeout=UPSTREAM_HARD_TIMEOUT_SECONDS,
+                        )
+                    else:
+                        resp = await forward_request_to_upstream(req)
+                except asyncio.TimeoutError:
+                    # Mark as concluded to avoid the caller being considered "inflight" forever
+                    self.last_response_received_ts = time.monotonic()
+                    # Return a synthetic 504 to the client
+                    logger.warning(
+                        "Upstream hard-timeout after %.2fs (ACCESS_API_UPSTREAM_HARD_TIMEOUT_SECONDS)",
+                        UPSTREAM_HARD_TIMEOUT_SECONDS,
+                    )
+                    return httpx.Response(
+                        status_code=504,
+                        content=b"Upstream gateway timeout",
+                        headers={"content-type": "text/plain; charset=utf-8"},
+                    )
+                else:
+                    self.last_response_received_ts = time.monotonic()
+                    return resp
 
             time_to_reset = self._reset_limit()
             if time_to_reset is not None:
@@ -102,6 +126,17 @@ def recalculate_caller_limit(caller: Caller):
 
 
 UPSTREAM_BASE = "http://127.0.0.1:8001"
+# Optional global hard timeout (seconds) for a single upstream attempt.
+# If <= 0 (default), disabled and httpx timeouts apply.
+def _parse_float(env_value: Optional[str], default: float) -> float:
+    try:
+        return float(env_value) if env_value is not None else default
+    except Exception:
+        return default
+
+UPSTREAM_HARD_TIMEOUT_SECONDS: float = _parse_float(
+    os.getenv("ACCESS_API_UPSTREAM_HARD_TIMEOUT_SECONDS"), 0.0
+)
 OUTBOUND_MAX_CONNECTIONS = 1000
 OUTBOUND_MAX_KEEPALIVE = 1000
 
@@ -281,7 +316,8 @@ async def proxy(path: str, request: Request):
         time_from_last_interaction = time.monotonic() - max(
             caller.last_response_received_ts, caller.last_call_ts
         )
-        if time_from_last_interaction > MAX_CALLER_IDLE_TIME_SECONDS:
+        has_inflight = caller.last_call_ts > caller.last_response_received_ts
+        if not has_inflight and time_from_last_interaction > MAX_CALLER_IDLE_TIME_SECONDS:
             callers_by_id.pop(caller_id)
             n_callers -= 1
     if conn_id in callers_by_id:
@@ -310,6 +346,22 @@ async def proxy(path: str, request: Request):
         continue
 
 
+def setup_logging(level: int = logging.INFO) -> None:
+    handler = logging.StreamHandler(stream=sys.stdout)  # use stderr if you prefer
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    datefmt = "%Y-%m-%dT%H:%M:%S%z"
+    formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
+    formatter.converter = time.gmtime  # UTC timestamps; remove for local time
+    handler.setFormatter(formatter)
+
+    logging.basicConfig(
+        level=level,
+        handlers=[handler],
+        force=True,  # replace existing handlers (py>=3.8)
+    )
+
+setup_logging(logging.DEBUG)
+
 if __name__ == "__main__":
     import copy
     from uvicorn.config import LOGGING_CONFIG as UVICORN_LOGGING_CONFIG
@@ -319,9 +371,9 @@ if __name__ == "__main__":
     for name in ("default", "access"):
         fmt = log_config["formatters"][name]["fmt"]
         log_config["formatters"][name]["fmt"] = "%(asctime)s " + fmt
-        log_config["formatters"][name]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+        log_config["formatters"][name]["datefmt"] = "%H:%M:%S"
     uvicorn.run(
-        "new:app",
+        "access_api:app",
         host="0.0.0.0",
         port=5812,
         log_config=log_config,
