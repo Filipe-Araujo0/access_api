@@ -34,15 +34,22 @@ def set_pause(seconds: float) -> None:
     now = time.monotonic()
     PAUSED_UNTIL = max(PAUSED_UNTIL, now + seconds)
 
+STRIP_HOP_BY_HOP_HEADERS = {
+    "connection","keep-alive","proxy-authenticate","proxy-authorization",
+    "te","trailer","transfer-encoding","upgrade",
+    "content-length","content-encoding"
+}
 
 async def forward_request_to_upstream(req: Request) -> httpx.Response:
     """Encaminha o request bruto ao upstream preservando corpo e cabeçalhos."""
     method = req.method.upper()
     path = req.url.path
     query = str(req.url.query)
-    headers = {k: v for k, v in req.headers.items()}
+    headers = {k: v for k, v in req.headers.items() if k.lower() not in STRIP_HOP_BY_HOP_HEADERS}
+    headers.pop("host", None)
     body = await req.body()
     url = path + (("?" + query) if query else "")
+    print([method, url, headers, body])
     return await req.app.state.http.request(method, url, headers=headers, content=body)
 
 
@@ -179,7 +186,7 @@ RATE_LIMIT_STATUS_CODES = {429, 503}
 
 def build_fastapi_response(r: httpx.Response) -> Response:
     """Converte httpx.Response em fastapi.Response filtrando cabeçalhos hop-by-hop."""
-    resp_headers = {k: v for k, v in r.headers.items()}
+    resp_headers = {k: v for k, v in r.headers.items() if k.lower() not in STRIP_HOP_BY_HOP_HEADERS}
     return Response(
         content=r.content,
         status_code=r.status_code,
